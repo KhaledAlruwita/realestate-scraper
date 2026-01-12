@@ -1,4 +1,3 @@
-import argparse
 import json
 import os
 import re
@@ -6,24 +5,34 @@ import signal
 import sqlite3
 import time
 from datetime import datetime, timezone
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Tuple
+
 from bs4 import BeautifulSoup
 from playwright.sync_api import sync_playwright, TimeoutError as PWTimeoutError, Error as PWError
 
 
 # ---------------------------
-# Config
+# Tuning / Config (كل شيء هنا)
 # ---------------------------
-BASE = "https://www.realestate.com.au/"
+BASE = "https://sa.aqar.fm/"
 DEFAULT_FEED = BASE + "عقارات"
 AR_NUMBERS = str.maketrans("٠١٢٣٤٥٦٧٨٩", "0123456789")
+
 OUTPUT_PATH = "output/aqar.sqlite"
-max_pages_per_cycle = 200 # default is 200
-pages_delay = 0.2 # default is 0.2
-delay = 0.2 # default is 0.2
+
+max_pages_per_cycle = 200     # default = 200
+pages_delay = 0.2             # delay  betweem feeds ,default = 0.2
+delay = 0.2                   # delay betweem listings ,default = 0.2
+
+scroll_times = 2              #  default = 2
+pause = 0.2                   # pause affter scroll ,default = 0.2
+
+
+feed_retry_times = 2          
+feed_retry_wait = 0.35    
+
 STOP = False
-scroll_times=2 #default is 2
-pause=0.2 # default is 0.2
+
 
 def log(level: str, msg: str):
     print(f"[{level}] {msg}", flush=True)
@@ -133,11 +142,6 @@ def db_connect(db_path: str) -> sqlite3.Connection:
 
 
 def ensure_schema_upgrades(conn: sqlite3.Connection):
-    """
-    If you already created DB previously, these columns might not exist.
-    We add them safely.
-    """
-    # columns we need (name -> sql type)
     wanted = {
         "price_text_full": "TEXT",
         "price_amount": "REAL",
@@ -147,7 +151,7 @@ def ensure_schema_upgrades(conn: sqlite3.Connection):
     }
 
     cur = conn.execute("PRAGMA table_info(listings)")
-    existing = {row[1] for row in cur.fetchall()}  # row[1] is column name
+    existing = {row[1] for row in cur.fetchall()}
 
     for col, typ in wanted.items():
         if col not in existing:
@@ -231,7 +235,7 @@ def db_upsert(conn: sqlite3.Connection, row: Dict[str, object]):
 
 
 # ---------------------------
-# Parsing: ld+json (fast baseline)
+# Parsing: ld+json
 # ---------------------------
 def parse_ld_json(html: str) -> Dict[str, object]:
     soup = BeautifulSoup(html, "html.parser")
@@ -250,7 +254,6 @@ def parse_ld_json(html: str) -> Dict[str, object]:
     out["title"] = clean_text(str(data.get("name", "")))
     out["description"] = clean_text(str(data.get("description", "")))
 
-    # offers.price (numeric) - helpful but missing period/terms
     offers = data.get("offers") or {}
     if isinstance(offers, dict):
         price = offers.get("price")
@@ -258,16 +261,13 @@ def parse_ld_json(html: str) -> Dict[str, object]:
         out["price_amount"] = float(price) if isinstance(price, (int, float)) else None
         out["price_currency"] = clean_text(str(currency or ""))
 
-    # address
     addr = data.get("address") or {}
     if isinstance(addr, dict):
         out["street"] = clean_text(str(addr.get("streetAddress", "")))
         out["district"] = clean_text(str(addr.get("addressLocality", "")))
         out["region"] = clean_text(str(addr.get("addressRegion", "")))
-        # city often not separate in ldjson
         out["city"] = ""
 
-    # amenityFeature
     feats = data.get("amenityFeature") or []
     feature_names: List[str] = []
     rooms = baths = area = ""
@@ -297,7 +297,6 @@ def parse_ld_json(html: str) -> Dict[str, object]:
     if area:
         out["area"] = f"{area}م²" if not str(area).endswith("م²") else area
 
-    # floorSize fallback
     if not out.get("area"):
         fs = data.get("floorSize")
         if isinstance(fs, dict) and fs.get("value") is not None:
@@ -306,31 +305,15 @@ def parse_ld_json(html: str) -> Dict[str, object]:
     return out
 
 
-# ---------------------------
-# Parsing: DOM price text -> amount + period + terms
-# ---------------------------
 def parse_price_dom(html: str) -> Dict[str, object]:
-    """
-    Example:
-    <h2 class="_price__EH7rC"><span>80,000 <span class="icon-NewSaudiCurrency"></span></span>/سنوي (دفعة واحدة)</h2>
-
-    We extract:
-      price_text_full: "80,000 /سنوي (دفعة واحدة)"
-      price_amount: 80000
-      price_currency: "SAR" (or "ريال" optional)
-      price_period: yearly/monthly/weekly/daily/unknown
-      payment_terms: "دفعة واحدة"
-    """
     soup = BeautifulSoup(html, "html.parser")
     h2 = soup.select_one("h2._price__EH7rC") or soup.select_one("h2[class*='_price__']")
     if not h2:
         return {}
 
     full = clean_text(h2.get_text(" ", strip=True))
-    # normalize currency icon
     full_norm = full.replace("﷼", "").replace("SAR", "").strip()
 
-    # amount: first number with commas
     m_amt = re.search(r"(\d[\d,\.]*)", full_norm)
     price_amount = None
     if m_amt:
@@ -340,7 +323,6 @@ def parse_price_dom(html: str) -> Dict[str, object]:
         except Exception:
             price_amount = None
 
-    # period
     period = "unknown"
     if "/سنوي" in full_norm or "سنوي" in full_norm:
         period = "yearly"
@@ -351,15 +333,12 @@ def parse_price_dom(html: str) -> Dict[str, object]:
     elif "/يومي" in full_norm or "يومي" in full_norm:
         period = "daily"
 
-    # payment terms in parentheses
     terms = ""
     m_terms = re.search(r"\(([^)]+)\)", full_norm)
     if m_terms:
         terms = clean_text(m_terms.group(1))
 
-    # currency: Aqar uses NewSaudiCurrency icon; we store SAR
     currency = "SAR" if "SaudiCurrency" in html or "icon-NewSaudiCurrency" in html else ""
-
     return {
         "price_text_full": full,
         "price_amount": price_amount,
@@ -369,9 +348,6 @@ def parse_price_dom(html: str) -> Dict[str, object]:
     }
 
 
-# ---------------------------
-# Parsing: other DOM fallbacks
-# ---------------------------
 def parse_details_table(html: str) -> Dict[str, str]:
     soup = BeautifulSoup(html, "html.parser")
     details: Dict[str, str] = {}
@@ -471,7 +447,6 @@ def parse_features_dom(html: str) -> str:
         t = clean_text(el.get_text(" ", strip=True))
         if t:
             feats.append(t)
-    # dedup
     seen = set()
     out = []
     for f in feats:
@@ -491,7 +466,7 @@ def parse_map_coords(html: str) -> Tuple[str, str, str]:
 
 
 # ---------------------------
-# Feed: URLs
+# Feed
 # ---------------------------
 def scroll_to_load(page, scroll_times: int = 2, pause: float = 0.2):
     for _ in range(scroll_times):
@@ -501,31 +476,55 @@ def scroll_to_load(page, scroll_times: int = 2, pause: float = 0.2):
         sleep_interruptible(pause)
 
 
+def extract_urls_from_html(html: str) -> List[str]:
+    
+    found = re.findall(r'href="([^"]+-\d{6,})"', html)
+    out: List[str] = []
+    seen = set()
+    for u in found:
+        if not u:
+            continue
+        if u.startswith("/"):
+            u = BASE.rstrip("/") + u
+        u = u.split("#", 1)[0]
+        if re.search(r"-\d{6,}$", u) and u not in seen:
+            seen.add(u)
+            out.append(u)
+    return out
+
+
 def collect_listing_urls(page) -> List[str]:
+    # 1) 
     sel = "a:has(div[class*='_listingCard__'])"
     try:
         urls = page.eval_on_selector_all(sel, "els => els.map(e => e.href)")
     except Exception:
         urls = []
 
-    if not urls:
-        try:
-            urls = page.eval_on_selector_all("a[href]", "els => els.map(e => e.href)")
-        except Exception:
-            urls = []
-
-    out = []
+    out: List[str] = []
     seen = set()
-    for u in urls:
-        if not u:
-            continue
-        u = u.split("#", 1)[0]
-        if not re.search(r"-\d{6,}$", u):
-            continue
-        if u not in seen:
-            seen.add(u)
-            out.append(u)
-    return out
+
+    if urls:
+        for u in urls:
+            if not u:
+                continue
+            u = u.split("#", 1)[0]
+            if re.search(r"-\d{6,}$", u) and u not in seen:
+                seen.add(u)
+                out.append(u)
+        if out:
+            return out
+
+    # 2) fallback: regex
+    try:
+        html = page.content()
+        out = extract_urls_from_html(html)
+        if out:
+            return out
+    except Exception:
+        pass
+
+    return []
 
 
 # ---------------------------
@@ -540,42 +539,31 @@ def scrape_listing_fast(page, url: str) -> Dict[str, object]:
 
     html = page.content()
 
-    # 1) ld+json baseline
     ld = parse_ld_json(html)
-
-    # 2) DOM price (richer: /سنوي (دفعة واحدة))
     dom_price = parse_price_dom(html)
 
-    # 3) fallbacks
     details = parse_details_table(html)
     addr3 = parse_address_tab3(html)
     maps_url, lat, lon = parse_map_coords(html)
 
-    # features: ld first else DOM
     features = clean_text(str(ld.get("features", "")))
     if not features:
         features = parse_features_dom(html)
 
     listing_id = clean_text(details.get("رقم الإعلان", "")) or extract_listing_id(url)
 
-    # title
     title = clean_text(str(ld.get("title", "")))
-
-    # description
     description = clean_text(str(ld.get("description", "")))
 
-    # price: prefer DOM price_text_full + amount + period + terms
     price_text_full = dom_price.get("price_text_full") or ""
     price_amount = dom_price.get("price_amount")
     price_currency = dom_price.get("price_currency") or (ld.get("price_currency") or "SAR")
     price_period = dom_price.get("price_period") or "unknown"
     payment_terms = dom_price.get("payment_terms") or ""
 
-    # if DOM missing amount, fallback to ld price_amount
     if price_amount is None:
         price_amount = ld.get("price_amount")
 
-    # Normalize price_amount type for sqlite
     if isinstance(price_amount, str):
         try:
             price_amount = float(price_amount.replace(",", ""))
@@ -624,23 +612,12 @@ def scrape_listing_fast(page, url: str) -> Dict[str, object]:
     return row
 
 
-
 # ---------------------------
 # Main
 # ---------------------------
 def main():
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--feed", default=DEFAULT_FEED)
-    ap.add_argument("--db", default=OUTPUT_PATH, help="SQLite path on SSD")
-    ap.add_argument("--max-pages-per-cycle", type=int, default=max_pages_per_cycle)
-    ap.add_argument("--page-delay", type=float, default=pages_delay)
-    ap.add_argument("--delay", type=float, default=delay)
-    ap.add_argument("--headful", action="store_true")
-    ap.add_argument("--rescrape", action="store_true", help="Rescrape even if listing_id exists")
-    args = ap.parse_args()
-
-    conn = db_connect(args.db)
-    log("INFO", f"DB: {args.db}")
+    conn = db_connect(OUTPUT_PATH)
+    log("INFO", f"DB: {OUTPUT_PATH}")
 
     pw = None
     browser = None
@@ -649,11 +626,9 @@ def main():
 
     try:
         pw = sync_playwright().start()
-        browser = pw.chromium.launch(headless=not args.headful)
+        browser = pw.chromium.launch(headless=True)
         context = browser.new_context(locale="ar-SA")
         page = context.new_page()
-
-        # Block heavy resources for speed
 
         def route_handler(route):
             r = route.request
@@ -663,21 +638,22 @@ def main():
 
         page.route("**/*", route_handler)
 
-
         cycle = 0
         while not STOP:
             cycle += 1
             log("INFO", f"===== CYCLE {cycle} START =====")
 
-            for pnum in range(1, args.max_pages_per_cycle + 1):
+            for pnum in range(1, max_pages_per_cycle + 1):
                 if STOP:
                     break
 
-                feed_url = feed_page_url(args.feed, pnum)
+                feed_url = feed_page_url(DEFAULT_FEED, pnum)
                 log("STEP", f"Loading feed page {pnum}: {feed_url}")
 
                 try:
                     page.goto(feed_url, wait_until="domcontentloaded", timeout=60000)
+                    # لمسة صغيرة تعالج تأخر React بدون ما تقتل السرعة
+                    page.wait_for_timeout(120)
                 except PWTimeoutError:
                     log("WARN", "Feed load timeout")
                     continue
@@ -685,11 +661,18 @@ def main():
                     log("ERROR", f"Feed load error: {e}")
                     continue
 
-                scroll_to_load(page, scroll_times)
+                scroll_to_load(page, scroll_times, pause)
                 if STOP:
                     break
 
-                urls = collect_listing_urls(page)
+                # retry لو طلع 0
+                urls: List[str] = []
+                for _ in range(feed_retry_times + 1):
+                    urls = collect_listing_urls(page)
+                    if urls:
+                        break
+                    page.wait_for_timeout(int(feed_retry_wait * 1000))
+
                 log("INFO", f"Found {len(urls)} listing URLs on page {pnum}")
 
                 for u in urls:
@@ -700,7 +683,7 @@ def main():
                     if not lid:
                         continue
 
-                    if (not args.rescrape) and db_has_listing(conn, lid):
+                    if db_has_listing(conn, lid):
                         db_touch_seen(conn, lid)
                         continue
 
@@ -714,12 +697,12 @@ def main():
                     except Exception as e:
                         log("ERROR", f"Listing error {lid}: {e}")
 
-                    sleep_interruptible(args.delay)
+                    sleep_interruptible(delay)
 
-                sleep_interruptible(args.page_delay)
+                sleep_interruptible(pages_delay)
 
             log("INFO", f"===== CYCLE {cycle} END =====")
-            sleep_interruptible(args.page_delay)
+            sleep_interruptible(pages_delay)
 
     finally:
         log("INFO", "Shutting down...")
