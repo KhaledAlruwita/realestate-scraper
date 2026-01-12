@@ -14,14 +14,16 @@ from playwright.sync_api import sync_playwright, TimeoutError as PWTimeoutError,
 # ---------------------------
 # Config
 # ---------------------------
-OUTPUT_PATH = "output/aqar.sqlite"
-max_pages_per_cycle = 200
-pages_delay = 0.2
-delay = 0.1
-STOP = False
-BASE = ""
+BASE = "https://www.realestate.com.au/"
 DEFAULT_FEED = BASE + "عقارات"
 AR_NUMBERS = str.maketrans("٠١٢٣٤٥٦٧٨٩", "0123456789")
+OUTPUT_PATH = "output/aqar.sqlite"
+max_pages_per_cycle = 200 # default is 200
+pages_delay = 0.2 # default is 0.2
+delay = 0.2 # default is 0.2
+STOP = False
+scroll_times=2 #default is 2
+pause=0.2 # default is 0.2
 
 def log(level: str, msg: str):
     print(f"[{level}] {msg}", flush=True)
@@ -88,8 +90,8 @@ CREATE TABLE IF NOT EXISTS listings (
   price_text_full TEXT,
   price_amount REAL,
   price_currency TEXT,
-  price_period TEXT,     
-  payment_terms TEXT,    
+  price_period TEXT,     -- yearly/monthly/weekly/daily/unknown
+  payment_terms TEXT,    -- e.g. "دفعة واحدة" or "دفعات"
 
   region TEXT,
   city TEXT,
@@ -135,7 +137,7 @@ def ensure_schema_upgrades(conn: sqlite3.Connection):
     If you already created DB previously, these columns might not exist.
     We add them safely.
     """
-    
+    # columns we need (name -> sql type)
     wanted = {
         "price_text_full": "TEXT",
         "price_amount": "REAL",
@@ -355,7 +357,7 @@ def parse_price_dom(html: str) -> Dict[str, object]:
     if m_terms:
         terms = clean_text(m_terms.group(1))
 
-
+    # currency: Aqar uses NewSaudiCurrency icon; we store SAR
     currency = "SAR" if "SaudiCurrency" in html or "icon-NewSaudiCurrency" in html else ""
 
     return {
@@ -652,13 +654,15 @@ def main():
         page = context.new_page()
 
         # Block heavy resources for speed
+
         def route_handler(route):
             r = route.request
-            if r.resource_type in ("image", "media", "font", "stylesheet"):
+            if r.resource_type in ("image", "media", "font", "stylesheet", "other"):
                 return route.abort()
             return route.continue_()
 
         page.route("**/*", route_handler)
+
 
         cycle = 0
         while not STOP:
@@ -681,7 +685,7 @@ def main():
                     log("ERROR", f"Feed load error: {e}")
                     continue
 
-                scroll_to_load(page, scroll_times=2, pause=0.2)
+                scroll_to_load(page, scroll_times)
                 if STOP:
                     break
 
@@ -704,7 +708,7 @@ def main():
                         row = scrape_listing_fast(page, u)
                         if row.get("listing_id"):
                             db_upsert(conn, row)
-                            log("OK", f"Saved {row['listing_id']} | {row.get('price_period','')} | {row.get('payment_terms','')}")
+                            log("DONE", f"Saved {row['listing_id']}|{datetime.now().isoformat()}")
                     except PWError as e:
                         log("ERROR", f"Listing error {lid}: {e}")
                     except Exception as e:
