@@ -10,9 +10,7 @@ from typing import Dict, List, Optional, Tuple
 from bs4 import BeautifulSoup
 from playwright.sync_api import sync_playwright, TimeoutError as PWTimeoutError, Error as PWError
 
-BASE = "https://sa.aqar.fm/"
-DEFAULT_FEED = BASE + "عقارات"
-AR_NUMBERS = str.maketrans("٠١٢٣٤٥٦٧٨٩", "0123456789")
+
 # ---------------------------
 # Config
 # ---------------------------
@@ -21,7 +19,9 @@ max_pages_per_cycle = 200
 pages_delay = 0.2
 delay = 0.1
 STOP = False
-
+BASE = ""
+DEFAULT_FEED = BASE + "عقارات"
+AR_NUMBERS = str.maketrans("٠١٢٣٤٥٦٧٨٩", "0123456789")
 
 def log(level: str, msg: str):
     print(f"[{level}] {msg}", flush=True)
@@ -88,8 +88,8 @@ CREATE TABLE IF NOT EXISTS listings (
   price_text_full TEXT,
   price_amount REAL,
   price_currency TEXT,
-  price_period TEXT,     -- yearly/monthly/weekly/daily/unknown
-  payment_terms TEXT,    -- e.g. "دفعة واحدة" or "دفعات"
+  price_period TEXT,     
+  payment_terms TEXT,    
 
   region TEXT,
   city TEXT,
@@ -135,7 +135,7 @@ def ensure_schema_upgrades(conn: sqlite3.Connection):
     If you already created DB previously, these columns might not exist.
     We add them safely.
     """
-    # columns we need (name -> sql type)
+    
     wanted = {
         "price_text_full": "TEXT",
         "price_amount": "REAL",
@@ -355,7 +355,7 @@ def parse_price_dom(html: str) -> Dict[str, object]:
     if m_terms:
         terms = clean_text(m_terms.group(1))
 
-    # currency: Aqar uses NewSaudiCurrency icon; we store SAR
+
     currency = "SAR" if "SaudiCurrency" in html or "icon-NewSaudiCurrency" in html else ""
 
     return {
