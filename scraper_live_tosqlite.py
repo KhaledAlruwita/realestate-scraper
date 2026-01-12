@@ -30,8 +30,10 @@ pause = 0.2                   # pause affter scroll ,default = 0.2
 
 feed_retry_times = 2          
 feed_retry_wait = 0.35    
-
 STOP = False
+no_gui = True 
+
+
 
 
 def log(level: str, msg: str):
@@ -626,7 +628,7 @@ def main():
 
     try:
         pw = sync_playwright().start()
-        browser = pw.chromium.launch(headless=True)
+        browser = pw.chromium.launch(headless=no_gui)
         context = browser.new_context(locale="ar-SA")
         page = context.new_page()
 
