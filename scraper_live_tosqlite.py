@@ -12,9 +12,9 @@ from playwright.sync_api import sync_playwright, TimeoutError as PWTimeoutError,
 
 
 # ---------------------------
-# Tuning / Config (كل شيء هنا)
+# Tuning //// Config
 # ---------------------------
-BASE = "https://sa.aqar.fm/"
+BASE = "https://www.realestate.com.au/"
 DEFAULT_FEED = BASE + "عقارات"
 AR_NUMBERS = str.maketrans("٠١٢٣٤٥٦٧٨٩", "0123456789")
 
