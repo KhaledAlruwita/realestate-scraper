@@ -1,3 +1,4 @@
+
 import json
 import os
 import re
@@ -14,26 +15,24 @@ from playwright.sync_api import sync_playwright, TimeoutError as PWTimeoutError,
 # ---------------------------
 # Tuning //// Config
 # ---------------------------
-BASE = "https://www.realestate.com.au/"
+BASE = ""
 DEFAULT_FEED = BASE + "عقارات"
 AR_NUMBERS = str.maketrans("٠١٢٣٤٥٦٧٨٩", "0123456789")
 
 OUTPUT_PATH = "output/aqar.sqlite"
 
 max_pages_per_cycle = 200     # default = 200
-pages_delay = 0.2             # delay  betweem feeds ,default = 0.2
-delay = 0.2                   # delay betweem listings ,default = 0.2
+pages_delay = 0.2             # delay between feeds, default = 0.2
+delay = 0.2                   # delay between listings, default = 0.2
 
-scroll_times = 2              #  default = 2
-pause = 0.2                   # pause affter scroll ,default = 0.2
+scroll_times = 2              # default = 2
+pause = 0.2                   # pause after scroll, default = 0.2
 
+feed_retry_times = 2
+feed_retry_wait = 0.35
 
-feed_retry_times = 2          
-feed_retry_wait = 0.35    
 STOP = False
-no_gui = True 
-
-
+no_gui = True
 
 
 def log(level: str, msg: str):
@@ -96,13 +95,14 @@ CREATE TABLE IF NOT EXISTS listings (
   listing_url TEXT,
 
   title TEXT,
+  category TEXT,  
 
   -- price
   price_text_full TEXT,
   price_amount REAL,
   price_currency TEXT,
-  price_period TEXT,     -- yearly/monthly/weekly/daily/unknown
-  payment_terms TEXT,    -- e.g. "دفعة واحدة" or "دفعات"
+  price_period TEXT,
+  payment_terms TEXT,
 
   region TEXT,
   city TEXT,
@@ -131,6 +131,7 @@ CREATE TABLE IF NOT EXISTS listings (
 );
 
 CREATE INDEX IF NOT EXISTS idx_listings_last_seen_at ON listings(last_seen_at);
+CREATE INDEX IF NOT EXISTS idx_listings_category ON listings(category);
 """
 
 
@@ -150,6 +151,7 @@ def ensure_schema_upgrades(conn: sqlite3.Connection):
         "price_currency": "TEXT",
         "price_period": "TEXT",
         "payment_terms": "TEXT",
+        "category": "TEXT",  # ✅ NEW
     }
 
     cur = conn.execute("PRAGMA table_info(listings)")
@@ -177,7 +179,7 @@ def db_upsert(conn: sqlite3.Connection, row: Dict[str, object]):
         """
         INSERT INTO listings (
           listing_id, listing_url,
-          title,
+          title, category,
           price_text_full, price_amount, price_currency, price_period, payment_terms,
           region, city, district, street, postal_code, building_no, additional_no,
           area, rooms, halls, baths, description,
@@ -187,7 +189,7 @@ def db_upsert(conn: sqlite3.Connection, row: Dict[str, object]):
           scraped_at, last_seen_at
         ) VALUES (
           :listing_id, :listing_url,
-          :title,
+          :title, :category,
           :price_text_full, :price_amount, :price_currency, :price_period, :payment_terms,
           :region, :city, :district, :street, :postal_code, :building_no, :additional_no,
           :area, :rooms, :halls, :baths, :description,
@@ -199,6 +201,7 @@ def db_upsert(conn: sqlite3.Connection, row: Dict[str, object]):
         ON CONFLICT(listing_id) DO UPDATE SET
           listing_url=excluded.listing_url,
           title=excluded.title,
+          category=excluded.category,
 
           price_text_full=excluded.price_text_full,
           price_amount=excluded.price_amount,
@@ -237,7 +240,7 @@ def db_upsert(conn: sqlite3.Connection, row: Dict[str, object]):
 
 
 # ---------------------------
-# Parsing: ld+json
+# Parsing
 # ---------------------------
 def parse_ld_json(html: str) -> Dict[str, object]:
     soup = BeautifulSoup(html, "html.parser")
@@ -278,11 +281,9 @@ def parse_ld_json(html: str) -> Dict[str, object]:
             if not isinstance(f, dict):
                 continue
             name = clean_text(str(f.get("name", "")))
-
             if name and name not in feature_names:
                 if name not in ("عدد الغرف", "عدد دورات المياه", "المساحة (متر مربع)"):
                     feature_names.append(name)
-
             if name == "عدد الغرف" and "value" in f:
                 rooms = clean_text(str(f.get("value", "")))
             if name == "عدد دورات المياه" and "value" in f:
@@ -348,6 +349,24 @@ def parse_price_dom(html: str) -> Dict[str, object]:
         "price_period": period,
         "payment_terms": terms,
     }
+
+
+def parse_category_dom(html: str) -> str:
+    """
+    Extracts category like:
+      <div class="_categoryRow__Okbj_"><div class="_auction__S3Fdx"><h2>عمارة للبيع</h2></div></div>
+    or sometimes just <h2>شقة للإيجار</h2> inside that row.
+    """
+    soup = BeautifulSoup(html, "html.parser")
+    h2 = soup.select_one("div._categoryRow__Okbj_ h2")
+    if h2:
+        return clean_text(h2.get_text(" ", strip=True))
+    # fallback: first h2 on page that isn't price
+    for cand in soup.find_all("h2"):
+        txt = clean_text(cand.get_text(" ", strip=True))
+        if txt and "SaudiCurrency" not in txt and "ريال" not in txt and txt != "موقع دقيق":
+            return txt
+    return ""
 
 
 def parse_details_table(html: str) -> Dict[str, str]:
@@ -479,7 +498,6 @@ def scroll_to_load(page, scroll_times: int = 2, pause: float = 0.2):
 
 
 def extract_urls_from_html(html: str) -> List[str]:
-    
     found = re.findall(r'href="([^"]+-\d{6,})"', html)
     out: List[str] = []
     seen = set()
@@ -496,7 +514,7 @@ def extract_urls_from_html(html: str) -> List[str]:
 
 
 def collect_listing_urls(page) -> List[str]:
-    # 1) 
+    # 1) DOM selector
     sel = "a:has(div[class*='_listingCard__'])"
     try:
         urls = page.eval_on_selector_all(sel, "els => els.map(e => e.href)")
@@ -543,6 +561,7 @@ def scrape_listing_fast(page, url: str) -> Dict[str, object]:
 
     ld = parse_ld_json(html)
     dom_price = parse_price_dom(html)
+    category = parse_category_dom(html)  
 
     details = parse_details_table(html)
     addr3 = parse_address_tab3(html)
@@ -577,6 +596,7 @@ def scrape_listing_fast(page, url: str) -> Dict[str, object]:
         "listing_url": url,
 
         "title": title,
+        "category": category, 
 
         "price_text_full": price_text_full,
         "price_amount": price_amount,
@@ -628,6 +648,7 @@ def main():
 
     try:
         pw = sync_playwright().start()
+        
         browser = pw.chromium.launch(headless=no_gui)
         context = browser.new_context(locale="ar-SA")
         page = context.new_page()
@@ -654,8 +675,7 @@ def main():
 
                 try:
                     page.goto(feed_url, wait_until="domcontentloaded", timeout=60000)
-                    # لمسة صغيرة تعالج تأخر React بدون ما تقتل السرعة
-                    page.wait_for_timeout(120)
+                    page.wait_for_timeout(120)  # small React settle
                 except PWTimeoutError:
                     log("WARN", "Feed load timeout")
                     continue
@@ -667,7 +687,6 @@ def main():
                 if STOP:
                     break
 
-                # retry لو طلع 0
                 urls: List[str] = []
                 for _ in range(feed_retry_times + 1):
                     urls = collect_listing_urls(page)
@@ -693,7 +712,7 @@ def main():
                         row = scrape_listing_fast(page, u)
                         if row.get("listing_id"):
                             db_upsert(conn, row)
-                            log("DONE", f"Saved {row['listing_id']}|{datetime.now().isoformat()}")
+                            log("DONE", f"Saved {row['listing_id']}|{datetime.now().isoformat()}|{row.get('category','')}")
                     except PWError as e:
                         log("ERROR", f"Listing error {lid}: {e}")
                     except Exception as e:
