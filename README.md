@@ -1,5 +1,4 @@
 # Real estate Scraper
-then run
 
 
 
@@ -12,7 +11,8 @@ Install the required dependencies using:
 pip install -r requirements.txt
 ```
 
-then run
+fill base url then run of scraper.py, then run
 ```bash
 python scraper.py
 ```
+
